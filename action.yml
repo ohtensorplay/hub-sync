@@ -1,0 +1,306 @@
+name: Sync GitHub to MEGA Hub
+description: Mirror a GitHub repository to a MEGA Hub model, dataset, or Space
+author: MEGA
+
+branding:
+  icon: upload-cloud
+  color: yellow
+
+inputs:
+  mega_repo_id:
+    required: true
+    description: MEGA repository ID in namespace/name form
+  mega_token:
+    required: true
+    description: MEGA access token with repository write permission
+  github_repo_id:
+    required: false
+    description: Source repository used in the generated commit message
+    default: ''
+  mega_endpoint:
+    required: false
+    description: MEGA Hub endpoint
+    default: https://mega.tensorplay.cn
+  repo_type:
+    required: false
+    description: Repository type (model, dataset, or space)
+    default: space
+  subdirectory:
+    required: false
+    description: Directory below the GitHub workspace to upload
+    default: .
+  revision:
+    required: false
+    description: Destination MEGA branch
+    default: main
+  private:
+    required: false
+    description: Create the destination as private when it does not exist
+    default: 'false'
+  sync:
+    required: false
+    description: Delete destination files that are absent from the selected source tree
+    default: 'true'
+  allow_empty:
+    required: false
+    description: Allow an empty source selection
+    default: 'false'
+  include:
+    required: false
+    description: Newline-separated file globs to include
+    default: ''
+  exclude:
+    required: false
+    description: Newline-separated file globs to exclude
+    default: |-
+      .git/**
+      .github/**
+  max_workers:
+    required: false
+    description: Maximum number of concurrent uploads
+    default: ''
+  commit_message:
+    required: false
+    description: Destination commit message
+    default: ''
+  mega_version:
+    required: false
+    description: megatensors package version; empty selects the latest release
+    default: ''
+
+outputs:
+  repo_url:
+    description: Web URL of the synchronized MEGA repository
+    value: ${{ steps.sync.outputs.repo_url }}
+  source_directory:
+    description: Canonical local directory that was synchronized
+    value: ${{ steps.sync.outputs.source_directory }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up uv
+      uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      with:
+        version: 0.11.16
+        enable-cache: true
+
+    - name: Sync to MEGA Hub
+      id: sync
+      shell: bash
+      env:
+        MEGA_REPO_ID: ${{ inputs.mega_repo_id }}
+        MEGA_TOKEN: ${{ inputs.mega_token }}
+        MEGA_ENDPOINT: ${{ inputs.mega_endpoint }}
+        MEGA_REPO_TYPE: ${{ inputs.repo_type }}
+        MEGA_SUBDIRECTORY: ${{ inputs.subdirectory }}
+        MEGA_REVISION: ${{ inputs.revision }}
+        MEGA_PRIVATE: ${{ inputs.private }}
+        MEGA_SYNC: ${{ inputs.sync }}
+        MEGA_ALLOW_EMPTY: ${{ inputs.allow_empty }}
+        MEGA_INCLUDE: ${{ inputs.include }}
+        MEGA_EXCLUDE: ${{ inputs.exclude }}
+        MEGA_MAX_WORKERS: ${{ inputs.max_workers }}
+        MEGA_COMMIT_MESSAGE: ${{ inputs.commit_message }}
+        MEGA_VERSION: ${{ inputs.mega_version }}
+        SOURCE_REPO_ID: ${{ inputs.github_repo_id }}
+      run: |
+        set -euo pipefail
+
+        fail() {
+          echo "::error::$*" >&2
+          exit 1
+        }
+
+        validate_boolean() {
+          local name=$1
+          local value=$2
+          if [[ "${value}" != "true" && "${value}" != "false" ]]; then
+            fail "${name} must be 'true' or 'false'."
+          fi
+        }
+
+        : "${MEGA_REPO_ID:?mega_repo_id is required}"
+        : "${MEGA_TOKEN:?mega_token is required}"
+
+        MEGA_ENDPOINT=${MEGA_ENDPOINT:-https://mega.tensorplay.cn}
+        MEGA_REPO_TYPE=${MEGA_REPO_TYPE:-space}
+        MEGA_SUBDIRECTORY=${MEGA_SUBDIRECTORY:-.}
+        MEGA_REVISION=${MEGA_REVISION:-main}
+        MEGA_PRIVATE=${MEGA_PRIVATE:-false}
+        MEGA_SYNC=${MEGA_SYNC:-true}
+        MEGA_ALLOW_EMPTY=${MEGA_ALLOW_EMPTY:-false}
+        MEGA_INCLUDE=${MEGA_INCLUDE:-}
+        MEGA_EXCLUDE=${MEGA_EXCLUDE:-$'.git/**\n.github/**'}
+        MEGA_MAX_WORKERS=${MEGA_MAX_WORKERS:-}
+        MEGA_COMMIT_MESSAGE=${MEGA_COMMIT_MESSAGE:-}
+        MEGA_VERSION=${MEGA_VERSION:-}
+        SOURCE_REPO_ID=${SOURCE_REPO_ID:-${GITHUB_REPOSITORY:-unknown/unknown}}
+
+        echo "::add-mask::${MEGA_TOKEN}"
+
+        case "${MEGA_REPO_TYPE}" in
+          model|dataset|space) ;;
+          *) fail "repo_type must be one of: model, dataset, space." ;;
+        esac
+        validate_boolean private "${MEGA_PRIVATE}"
+        validate_boolean sync "${MEGA_SYNC}"
+        validate_boolean allow_empty "${MEGA_ALLOW_EMPTY}"
+
+        namespace=${MEGA_REPO_ID%%/*}
+        repo_name=${MEGA_REPO_ID#*/}
+        if [[ "${namespace}" == "${MEGA_REPO_ID}" || -z "${namespace}" || -z "${repo_name}" || "${repo_name}" == */* ]]; then
+          fail "mega_repo_id must use the namespace/name form."
+        fi
+        if [[ "${MEGA_REPO_ID}" == *$'\n'* || "${MEGA_REPO_ID}" == *$'\r'* ]]; then
+          fail "mega_repo_id must not contain newlines."
+        fi
+        if [[ -z "${MEGA_REVISION}" || "${MEGA_REVISION}" == *$'\n'* || "${MEGA_REVISION}" == *$'\r'* ]]; then
+          fail "revision must be a non-empty single-line branch name."
+        fi
+        if [[ -n "${MEGA_MAX_WORKERS}" && ! "${MEGA_MAX_WORKERS}" =~ ^[1-9][0-9]*$ ]]; then
+          fail "max_workers must be a positive integer."
+        fi
+        if [[ -n "${MEGA_VERSION}" && ! "${MEGA_VERSION}" =~ ^[0-9A-Za-z][0-9A-Za-z.!+_-]*$ ]]; then
+          fail "mega_version must be a plain package version."
+        fi
+
+        MEGA_ENDPOINT=$(python3 - "${MEGA_ENDPOINT}" <<'PY'
+        import sys
+        from urllib.parse import urlsplit, urlunsplit
+
+        parsed = urlsplit(sys.argv[1])
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise SystemExit("::error::mega_endpoint must be an absolute HTTP(S) URL.")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise SystemExit("::error::mega_endpoint must not contain credentials, a query, or a fragment.")
+        print(urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", "")))
+        PY
+        )
+        export MEGA_ENDPOINT
+
+        workspace=$(realpath -e -- "${GITHUB_WORKSPACE:-${PWD}}") || fail "GitHub workspace does not exist."
+        if [[ "${MEGA_SUBDIRECTORY}" == /* ]]; then
+          source_candidate=${MEGA_SUBDIRECTORY}
+        else
+          source_candidate=${workspace}/${MEGA_SUBDIRECTORY}
+        fi
+        source_directory=$(realpath -e -- "${source_candidate}") || fail "subdirectory does not exist: ${MEGA_SUBDIRECTORY}"
+        [[ -d "${source_directory}" ]] || fail "subdirectory is not a directory: ${MEGA_SUBDIRECTORY}"
+        case "${source_directory}/" in
+          "${workspace}/"*) ;;
+          *) fail "subdirectory must resolve inside GITHUB_WORKSPACE." ;;
+        esac
+
+        while IFS= read -r -d '' symlink; do
+          target=$(realpath -m -- "${symlink}")
+          case "${target}/" in
+            "${source_directory}/"*) ;;
+            *) fail "source tree contains a symlink that resolves outside it: ${symlink#"${source_directory}/"}" ;;
+          esac
+        done < <(find "${source_directory}" -type l -print0)
+
+        selected_file_count=$(SOURCE_DIRECTORY="${source_directory}" python3 <<'PY'
+        import fnmatch
+        import os
+        from pathlib import Path
+
+        root = Path(os.environ["SOURCE_DIRECTORY"])
+        includes = [line.rstrip("\r") for line in os.environ.get("MEGA_INCLUDE", "").splitlines() if line.rstrip("\r")]
+        excludes = [line.rstrip("\r") for line in os.environ.get("MEGA_EXCLUDE", "").splitlines() if line.rstrip("\r")]
+        count = 0
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(root).as_posix()
+            if includes and not any(fnmatch.fnmatch(relative, pattern) for pattern in includes):
+                continue
+            if excludes and any(fnmatch.fnmatch(relative, pattern) for pattern in excludes):
+                continue
+            count += 1
+        print(count)
+        PY
+        )
+        if [[ "${selected_file_count}" == "0" && "${MEGA_ALLOW_EMPTY}" != "true" ]]; then
+          fail "No files remain after applying include/exclude rules. Set allow_empty=true only for an intentional empty sync."
+        fi
+
+        if [[ -n "${MEGA_VERSION}" ]]; then
+          mega=(uvx --from "megatensors==${MEGA_VERSION}" mega)
+        else
+          mega=(uvx --from megatensors mega)
+        fi
+
+        if [[ -z "${MEGA_COMMIT_MESSAGE}" ]]; then
+          if [[ -n "${GITHUB_SHA:-}" ]]; then
+            MEGA_COMMIT_MESSAGE="Sync from ${SOURCE_REPO_ID}@${GITHUB_SHA:0:12} via mega/hub-sync"
+          else
+            MEGA_COMMIT_MESSAGE="Sync from ${SOURCE_REPO_ID} via mega/hub-sync"
+          fi
+        fi
+
+        echo "::group::MEGA CLI version"
+        "${mega[@]}" version
+        echo "::endgroup::"
+
+        create=("${mega[@]}" repos create "${MEGA_REPO_ID}" --type "${MEGA_REPO_TYPE}" --exist-ok)
+        if [[ "${MEGA_PRIVATE}" == "true" ]]; then
+          create+=(--private)
+        fi
+        echo "::group::Create or resolve destination"
+        "${create[@]}"
+        echo "::endgroup::"
+
+        upload=(
+          "${mega[@]}" upload
+          "${MEGA_REPO_ID}"
+          "${source_directory}"
+          --repo-type "${MEGA_REPO_TYPE}"
+          --revision "${MEGA_REVISION}"
+          --commit-message "${MEGA_COMMIT_MESSAGE}"
+        )
+        if [[ "${MEGA_PRIVATE}" == "true" ]]; then
+          upload+=(--private)
+        fi
+        if [[ "${MEGA_SYNC}" == "true" ]]; then
+          upload+=(--sync)
+        fi
+        if [[ -n "${MEGA_MAX_WORKERS}" ]]; then
+          upload+=(--max-workers "${MEGA_MAX_WORKERS}")
+        fi
+        while IFS= read -r pattern || [[ -n "${pattern}" ]]; do
+          pattern=${pattern%$'\r'}
+          [[ -z "${pattern}" ]] || upload+=(--include "${pattern}")
+        done <<< "${MEGA_INCLUDE}"
+        while IFS= read -r pattern || [[ -n "${pattern}" ]]; do
+          pattern=${pattern%$'\r'}
+          [[ -z "${pattern}" ]] || upload+=(--exclude "${pattern}")
+        done <<< "${MEGA_EXCLUDE}"
+
+        echo "::group::Upload ${selected_file_count} selected files"
+        "${upload[@]}"
+        echo "::endgroup::"
+
+        case "${MEGA_REPO_TYPE}" in
+          model) repo_url="${MEGA_ENDPOINT}/${MEGA_REPO_ID}" ;;
+          dataset) repo_url="${MEGA_ENDPOINT}/datasets/${MEGA_REPO_ID}" ;;
+          space) repo_url="${MEGA_ENDPOINT}/spaces/${MEGA_REPO_ID}" ;;
+        esac
+
+        if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+          {
+            echo "repo_url=${repo_url}"
+            echo "source_directory=${source_directory}"
+          } >> "${GITHUB_OUTPUT}"
+        fi
+        if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+          {
+            echo "### MEGA Hub sync complete"
+            echo
+            echo "- Repository: [${MEGA_REPO_ID}](${repo_url})"
+            echo "- Type: \`${MEGA_REPO_TYPE}\`"
+            echo "- Revision: \`${MEGA_REVISION}\`"
+            echo "- Selected files: ${selected_file_count}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+        fi
+        echo "Sync completed: ${repo_url}"
