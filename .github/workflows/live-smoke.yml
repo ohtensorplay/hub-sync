@@ -1,0 +1,80 @@
+name: Live smoke test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Sync with MEGA Hub
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      MEGA_VERSION: 0.0.1
+      TEST_REPO_ID: mega/hub-sync-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.0
+
+      - name: Prepare source tree
+        shell: bash
+        run: |
+          mkdir -p .hub-sync-smoke
+          printf '%s\n' 'alpha-v1' > .hub-sync-smoke/alpha.txt
+          printf '%s\n' 'remove-me-on-second-sync' > .hub-sync-smoke/stale.txt
+
+      - name: Initial synchronization
+        uses: ./
+        with:
+          mega_repo_id: ${{ env.TEST_REPO_ID }}
+          mega_token: ${{ secrets.MEGA_TOKEN }}
+          mega_version: ${{ env.MEGA_VERSION }}
+          repo_type: model
+          subdirectory: .hub-sync-smoke
+          private: "true"
+          sync: "true"
+          max_workers: "2"
+          commit_message: hub-sync live smoke test - initial upload
+
+      - name: Remove stale source file
+        shell: bash
+        run: rm .hub-sync-smoke/stale.txt
+
+      - name: Mirror source deletion
+        id: mirror
+        continue-on-error: true
+        uses: ./
+        with:
+          mega_repo_id: ${{ env.TEST_REPO_ID }}
+          mega_token: ${{ secrets.MEGA_TOKEN }}
+          mega_version: ${{ env.MEGA_VERSION }}
+          repo_type: model
+          subdirectory: .hub-sync-smoke
+          private: "true"
+          sync: "true"
+          max_workers: "2"
+          commit_message: hub-sync live smoke test - mirror deletion
+
+      - name: Verify synchronized repository
+        if: always()
+        shell: bash
+        env:
+          MEGA_TOKEN: ${{ secrets.MEGA_TOKEN }}
+          MIRROR_OUTCOME: ${{ steps.mirror.outcome }}
+        run: |
+          files=$(uvx --from "megatensors==${MEGA_VERSION}" mega repos files \
+            "${TEST_REPO_ID}" --revision main --format json)
+          FILES_JSON="${files}" python3 - <<'PY'
+          import json
+          import os
+
+          paths = [item["path"] for item in json.loads(os.environ["FILES_JSON"])]
+          expected = ["alpha.txt"]
+          if paths != expected:
+              raise SystemExit(f"Expected {expected}, found {paths}")
+          if os.environ["MIRROR_OUTCOME"] != "success":
+              raise SystemExit(f"Mirror synchronization outcome: {os.environ['MIRROR_OUTCOME']}")
+          print("Live hub-sync verification passed")
+          PY
